@@ -429,7 +429,19 @@ public class ApiConfig {
             @Override
             public void success(String json) {
                 revalidatingLiveConfig = false;
-                if (TextUtils.isEmpty(json) || json.equals(cachedContent)) return;
+                if (TextUtils.isEmpty(json)) return;
+                if (json.equals(cachedContent)) {
+                    // 内容一致但复核可能已把地址切到 discovered（服务端换 IP 而内容相同）：
+                    // 仍需同步地址状态与 last-good 的 URL，否则 live_config_last.url 滞留旧地址，
+                    // 且 shouldReloadLiveConfig 因地址不匹配反复触发无谓重载。
+                    if (!liveApiUrl.equals(loadedLiveConfigUrl)) {
+                        loadedLiveConfigUrl = liveApiUrl;
+                        liveConfigFromCache = false;
+                        restoredOfflineForUrl = "";
+                        saveLastGoodLiveConfig(liveApiUrl, json);
+                    }
+                    return;
+                }
                 String previousSignature = liveChannelSignature();
                 try {
                     parseLiveConfigContent(liveApiUrl, json);

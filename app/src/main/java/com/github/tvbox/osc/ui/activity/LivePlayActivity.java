@@ -2807,6 +2807,10 @@ public class LivePlayActivity extends BaseActivity {
         } else {
             applyLiveChannelGroups(list);
         }
+        // 复用已加载配置直接渲染时也要复核：离线兜底后服务在原地址恢复，若不在这里触发，
+        // 本次进程内会一直用兜底内容直到下次强制重载。revalidateLiveConfigInBackground 自带
+        // isLiveConfigFromCache 门，网络新鲜加载时是 no-op，不产生多余请求。
+        revalidateLiveConfigInBackground();
     }
 
     private boolean loadingLiveConfigOnEnter = false;
