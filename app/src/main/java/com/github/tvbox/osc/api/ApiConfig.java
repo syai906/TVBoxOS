@@ -65,6 +65,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -90,9 +91,13 @@ public class ApiConfig {
     private String loadedLiveConfigUrl = "";
     private boolean liveConfigFromCache = false;
     private boolean revalidatingLiveConfig = false;
+    // 最近一次「连接失败后改用离线兜底」的地址，用于打断同一地址的反复重载
+    private String restoredOfflineForUrl = "";
     // 与订阅地址解耦的「最后一次成功直播配置」，用于离开局域网或服务端换 IP 时离线兜底
     private static final String LIVE_LAST_CONFIG_FILE = "live_config_last.m3u";
     private static final String LIVE_LAST_URL_FILE = "live_config_last.url";
+    // 直播源固定在局域网内，连不上就是服务真的不在：连接阶段收紧超时，别让用户等满默认 10s 才看到离线兜底
+    private static final long LIVE_FETCH_CONNECT_TIMEOUT_MS = 4000;
     public String wallpaper = "";
     private String danmaku = "";
 
@@ -307,6 +312,7 @@ public class ApiConfig {
                 if (hasLiveConfigResult()) {
                     loadedLiveConfigUrl = liveApiUrl;
                     liveConfigFromCache = true;
+                    seedLastGoodFromCache(liveApiUrl, live_cache);
                     callback.success();
                     return;
                 }
@@ -314,7 +320,7 @@ public class ApiConfig {
                 th.printStackTrace();
             }
         }
-        fetchConfigAsync(liveApiUrl, liveApiConfigUrl, liveConfigKey, new ConfigFetchCallback() {
+        fetchLiveConfigAsync(liveApiUrl, liveApiConfigUrl, liveConfigKey, new ConfigFetchCallback() {
             @Override
             public void success(String json) {
                 try {
@@ -325,6 +331,7 @@ public class ApiConfig {
                     }
                     loadedLiveConfigUrl = liveApiUrl;
                     liveConfigFromCache = false;
+                    restoredOfflineForUrl = "";
                     FileUtils.saveCache(live_cache, json);
                     saveLastGoodLiveConfig(liveApiUrl, json);
                     callback.success();
@@ -351,6 +358,7 @@ public class ApiConfig {
                         if (hasLiveConfigResult()) {
                             loadedLiveConfigUrl = liveApiUrl;
                             liveConfigFromCache = true;
+                            seedLastGoodFromCache(liveApiUrl, live_cache);
                             callback.success();
                             return;
                         }
@@ -360,6 +368,7 @@ public class ApiConfig {
                 }
                 // 当前地址的缓存不可用（例如服务端换了 IP）时，回退到最后一次成功配置
                 if (restoreLastGoodLiveConfig()) {
+                    restoredOfflineForUrl = liveApiUrl;
                     callback.notice("服务不可达，已离线使用上次成功的直播源");
                     callback.success();
                     return;
@@ -375,9 +384,15 @@ public class ApiConfig {
     }
 
     public boolean shouldReloadLiveConfig() {
+        if (liveChannelGroupList == null || liveChannelGroupList.isEmpty()) return true;
         String apiUrl = Hawk.get(HawkConfig.LIVE_API_URL, "");
         if (apiUrl.isEmpty()) apiUrl = Hawk.get(HawkConfig.API_URL, "");
-        return liveChannelGroupList == null || liveChannelGroupList.isEmpty() || !apiUrl.equals(loadedLiveConfigUrl);
+        if (apiUrl.equals(loadedLiveConfigUrl)) return false;
+        // 发现到与当前不同的地址（服务端换 IP / 回到局域网）时值得重载自愈
+        String discovered = LanServiceDiscovery.get().getConfigUrl();
+        if (!discovered.isEmpty() && !discovered.equals(apiUrl)) return true;
+        // 同一地址刚试过且已离线兜底渲染：别立刻再试，否则陷入「等超时→兜底→重载」循环并重复弹提示
+        return !apiUrl.equals(restoredOfflineForUrl);
     }
 
     public boolean isLiveConfigFromCache() {
@@ -410,7 +425,7 @@ public class ApiConfig {
         String liveApiConfigUrl = configUrl(liveApiUrl);
         final String liveConfigKey = TempKey;
         revalidatingLiveConfig = true;
-        fetchConfigAsync(liveApiUrl, liveApiConfigUrl, liveConfigKey, new ConfigFetchCallback() {
+        fetchLiveConfigAsync(liveApiUrl, liveApiConfigUrl, liveConfigKey, new ConfigFetchCallback() {
             @Override
             public void success(String json) {
                 revalidatingLiveConfig = false;
@@ -429,7 +444,9 @@ public class ApiConfig {
                 }
                 loadedLiveConfigUrl = liveApiUrl;
                 liveConfigFromCache = false;
+                restoredOfflineForUrl = "";
                 FileUtils.saveCache(liveCache, json);
+                saveLastGoodLiveConfig(liveApiUrl, json);
                 if (!liveChannelSignature().equals(previousSignature)) {
                     callback.updated();
                 }
@@ -480,11 +497,38 @@ public class ApiConfig {
 
     // ===== 离线兜底：与订阅地址解耦的「最后一次成功直播配置」 =====
 
-    private void saveLastGoodLiveConfig(String apiUrl, String content) {
+    /** 异步落盘：配置回调多在主线程，种子写入不能占用调用线程 */
+    private void saveLastGoodLiveConfig(final String apiUrl, final String content) {
         if (TextUtils.isEmpty(content)) return;
+        configLoadExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                writeLastGoodLiveConfig(apiUrl, content);
+            }
+        });
+    }
+
+    /**
+     * 缓存命中路径手上只有文件、没有内容串：读与写都放到后台线程，
+     * 避免升级用户（已有 MD5 缓存）永远种不下离线兜底种子。
+     */
+    private void seedLastGoodFromCache(final String apiUrl, final File cache) {
+        if (cache == null || !cache.exists()) return;
+        configLoadExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                String content = readLiveCache(cache);
+                if (TextUtils.isEmpty(content)) return;
+                writeLastGoodLiveConfig(apiUrl, content);
+            }
+        });
+    }
+
+    private void writeLastGoodLiveConfig(String apiUrl, String content) {
         String base = App.getInstance().getFilesDir().getAbsolutePath();
         FileUtils.saveCache(new File(base + "/" + LIVE_LAST_CONFIG_FILE), content);
         FileUtils.saveCache(new File(base + "/" + LIVE_LAST_URL_FILE), apiUrl == null ? "" : apiUrl);
+        LOG.i("echo-live-config last good saved, url=" + apiUrl + ", bytes=" + content.length());
     }
 
     /**
@@ -581,7 +625,17 @@ public class ApiConfig {
         void error(String error);
     }
 
+    /** 直播源走局域网：连接阶段用短超时，服务不在时尽快回落离线兜底 */
+    private void fetchLiveConfigAsync(String apiUrl, String requestUrl, String configKey, ConfigFetchCallback callback) {
+        fetchConfigAsync(apiUrl, requestUrl, configKey, callback, LIVE_FETCH_CONNECT_TIMEOUT_MS);
+    }
+
     private void fetchConfigAsync(final String apiUrl, final String requestUrl, final String configKey, final ConfigFetchCallback callback) {
+        fetchConfigAsync(apiUrl, requestUrl, configKey, callback, 0);
+    }
+
+    /** @param connectTimeoutMs 传 0 表示沿用共享 client 的默认超时 */
+    private void fetchConfigAsync(final String apiUrl, final String requestUrl, final String configKey, final ConfigFetchCallback callback, final long connectTimeoutMs) {
         configLoadExecutor.execute(new Runnable() {
             @Override
             public void run() {
@@ -594,6 +648,10 @@ public class ApiConfig {
                             .build();
                     okhttp3.OkHttpClient client = OkGoHelper.getDefaultClient();
                     if (client == null) client = com.github.catvod.net.OkHttp.client();
+                    // newBuilder() 复用连接池与调度器，只改本次调用的超时，不影响点播与 jar 下载
+                    if (connectTimeoutMs > 0 && client != null) {
+                        client = client.newBuilder().connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS).build();
+                    }
                     response = client.newCall(request).execute();
                     if (!response.isSuccessful()) {
                         error = "HTTP " + response.code();
