@@ -2824,6 +2824,7 @@ public class LivePlayActivity extends BaseActivity {
                         loadingLiveConfigOnEnter = false;
                         initLiveChannelList();
                         initLiveSettingGroupList();
+                        revalidateLiveConfigInBackground();
                     }
                 });
             }
@@ -2845,6 +2846,27 @@ public class LivePlayActivity extends BaseActivity {
                     @Override
                     public void run() {
                         Toast.makeText(LivePlayActivity.this, msg, Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+        });
+    }
+
+    /**
+     * 缓存渲染完成后复核服务端配置，频道列表有变化才重建列表并回到原频道。
+     */
+    private void revalidateLiveConfigInBackground() {
+        if (!ApiConfig.get().isLiveConfigFromCache()) return;
+        final int requestId = liveConfigRequestId;
+        ApiConfig.get().refreshLiveConfigIfChanged(new ApiConfig.LiveConfigRefreshCallback() {
+            @Override
+            public void updated() {
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (requestId != liveConfigRequestId || isFinishing()) return;
+                        Toast.makeText(LivePlayActivity.this, "直播源已更新", Toast.LENGTH_SHORT).show();
+                        refreshLiveChannelListAndPlay(getPreferredLiveRefreshChannelName(), getPreferredLiveRefreshSourceIndex());
                     }
                 });
             }

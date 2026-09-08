@@ -24,6 +24,7 @@ import com.github.tvbox.osc.bean.LiveSettingItem;
 import com.github.tvbox.osc.bean.ParseBean;
 import com.github.tvbox.osc.bean.ProxyRule;
 import com.github.tvbox.osc.bean.SourceBean;
+import com.github.tvbox.osc.discovery.LanServiceDiscovery;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.util.AES;
 import com.github.tvbox.osc.util.AdBlocker;
@@ -87,6 +88,11 @@ public class ApiConfig {
     private String currentLivePyKey = "";
     private String currentPlaySourceKey = "";
     private String loadedLiveConfigUrl = "";
+    private boolean liveConfigFromCache = false;
+    private boolean revalidatingLiveConfig = false;
+    // 与订阅地址解耦的「最后一次成功直播配置」，用于离开局域网或服务端换 IP 时离线兜底
+    private static final String LIVE_LAST_CONFIG_FILE = "live_config_last.m3u";
+    private static final String LIVE_LAST_URL_FILE = "live_config_last.url";
     public String wallpaper = "";
     private String danmaku = "";
 
@@ -193,41 +199,50 @@ public class ApiConfig {
     public void loadConfig(boolean useCache, LoadConfigCallback callback, Activity activity) {
         String apiUrl = Hawk.get(HawkConfig.API_URL, "");
         if (apiUrl.isEmpty()) {
+            // TVAgent 只提供直播源：点播这里不能阻塞等待发现（会卡住主线程），
+            // 仅把已发现的地址回填到直播，无点播配置时直接走 -1 分支
+            String discovered = LanServiceDiscovery.get().getConfigUrl();
+            if (!discovered.isEmpty() && Hawk.get(HawkConfig.LIVE_API_URL, "").isEmpty()) {
+                Hawk.put(HawkConfig.LIVE_API_URL, discovered);
+                LOG.i("echo-discovery: set LIVE_API_URL from discovery: " + discovered);
+            }
             callback.error("-1");
             return;
         }
-        File cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/" + MD5.encode(apiUrl));
+        // 回调内需要不可变引用
+        final String finalApiUrl = apiUrl;
+        File cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/" + MD5.encode(finalApiUrl));
         if (useCache && cache.exists()) {
             try {
                 String json = readConfigFile(cache);
-                if (switchApiCollectionIfNeeded(apiUrl, json)) {
+                if (switchApiCollectionIfNeeded(finalApiUrl, json)) {
                     loadConfig(false, callback, activity);
                     return;
                 }
-                clearApiLinesIfUnmatched(apiUrl);
-                parseJson(apiUrl, json);
+                clearApiLinesIfUnmatched(finalApiUrl);
+                parseJson(finalApiUrl, json);
                 callback.success();
                 return;
             } catch (Throwable th) {
                 th.printStackTrace();
             }
         }
-        String configUrl=configUrl(apiUrl);
+        String configUrl=configUrl(finalApiUrl);
 
         final String configKey = TempKey;
 
-        fetchConfigAsync(apiUrl, configUrl, configKey, new ConfigFetchCallback() {
+        fetchConfigAsync(finalApiUrl, configUrl, configKey, new ConfigFetchCallback() {
             @Override
             public void success(String json) {
                 try {
 //                            LOG.longI("echo-ConfigJson", json);
-                    if (switchApiCollectionIfNeeded(apiUrl, json)) {
+                    if (switchApiCollectionIfNeeded(finalApiUrl, json)) {
                         FileUtils.saveCache(cache,json);
                         loadConfig(false, callback, activity);
                         return;
                     }
-                    clearApiLinesIfUnmatched(apiUrl);
-                    parseJson(apiUrl, json);
+                    clearApiLinesIfUnmatched(finalApiUrl);
+                    parseJson(finalApiUrl, json);
                     FileUtils.saveCache(cache,json);
                     callback.success();
                 } catch (Throwable th) {
@@ -241,12 +256,12 @@ public class ApiConfig {
                 if (cache.exists()) {
                     try {
                         String json = readConfigFile(cache);
-                        if (switchApiCollectionIfNeeded(apiUrl, json)) {
+                        if (switchApiCollectionIfNeeded(finalApiUrl, json)) {
                             loadConfig(false, callback, activity);
                             return;
                         }
-                        clearApiLinesIfUnmatched(apiUrl);
-                        parseJson(apiUrl, json);
+                        clearApiLinesIfUnmatched(finalApiUrl);
+                        parseJson(finalApiUrl, json);
                         callback.success();
                         return;
                     } catch (Throwable th) {
@@ -264,7 +279,21 @@ public class ApiConfig {
             apiUrl = Hawk.get(HawkConfig.API_URL, "");
         }
         if (apiUrl.isEmpty()) {
-            callback.error("-1");
+            // 未配置直播地址：只取已发现的地址，绝不在调用线程（通常是主线程）阻塞等待
+            apiUrl = LanServiceDiscovery.get().getConfigUrl();
+            if (!apiUrl.isEmpty()) {
+                Hawk.put(HawkConfig.LIVE_API_URL, apiUrl);
+                LOG.i("echo-discovery: set LIVE_API_URL from discovery: " + apiUrl);
+            }
+        }
+        if (apiUrl.isEmpty()) {
+            // 不在局域网：先用上一次成功的地址与内容离线渲染
+            if (restoreLastGoodLiveConfig()) {
+                callback.success();
+                return;
+            }
+            // 既无配置也无离线缓存：后台等待发现，超时才报错，避免主线程卡死
+            awaitDiscoveryAndLoad(8000, callback);
             return;
         }
         final String liveApiUrl = apiUrl;
@@ -277,6 +306,7 @@ public class ApiConfig {
                 parseLiveConfigContent(liveApiUrl, live_cache);
                 if (hasLiveConfigResult()) {
                     loadedLiveConfigUrl = liveApiUrl;
+                    liveConfigFromCache = true;
                     callback.success();
                     return;
                 }
@@ -294,7 +324,9 @@ public class ApiConfig {
                         return;
                     }
                     loadedLiveConfigUrl = liveApiUrl;
+                    liveConfigFromCache = false;
                     FileUtils.saveCache(live_cache, json);
+                    saveLastGoodLiveConfig(liveApiUrl, json);
                     callback.success();
                 } catch (Throwable th) {
                     th.printStackTrace();
@@ -304,11 +336,21 @@ public class ApiConfig {
 
             @Override
             public void error(String error) {
+                // 拉取失败时，若发现的服务地址与当前不同（服务端 IP 变更），自愈切换并重载（最多一次）
+                String discovered = LanServiceDiscovery.get().getConfigUrl();
+                if (!discovered.isEmpty() && !discovered.equals(liveApiUrl) && !discovered.equals(loadedLiveConfigUrl)) {
+                    LOG.i("echo-discovery: live config fetch failed, switching to discovered url: " + discovered);
+                    Hawk.put(HawkConfig.LIVE_API_URL, discovered);
+                    loadedLiveConfigUrl = discovered;
+                    loadLiveConfig(false, callback);
+                    return;
+                }
                 if (live_cache.exists()) {
                     try {
                         parseLiveConfigContent(liveApiUrl, live_cache);
                         if (hasLiveConfigResult()) {
                             loadedLiveConfigUrl = liveApiUrl;
+                            liveConfigFromCache = true;
                             callback.success();
                             return;
                         }
@@ -316,6 +358,13 @@ public class ApiConfig {
                         th.printStackTrace();
                     }
                 }
+                // 当前地址的缓存不可用（例如服务端换了 IP）时，回退到最后一次成功配置
+                if (restoreLastGoodLiveConfig()) {
+                    callback.notice("服务不可达，已离线使用上次成功的直播源");
+                    callback.success();
+                    return;
+                }
+                callback.notice("直播源不可用：服务端不可达且无离线缓存");
                 callback.error("直播配置拉取失败");
             }
         });
@@ -329,6 +378,171 @@ public class ApiConfig {
         String apiUrl = Hawk.get(HawkConfig.LIVE_API_URL, "");
         if (apiUrl.isEmpty()) apiUrl = Hawk.get(HawkConfig.API_URL, "");
         return liveChannelGroupList == null || liveChannelGroupList.isEmpty() || !apiUrl.equals(loadedLiveConfigUrl);
+    }
+
+    public boolean isLiveConfigFromCache() {
+        return liveConfigFromCache;
+    }
+
+    public interface LiveConfigRefreshCallback {
+        void updated();
+    }
+
+    /**
+     * 缓存渲染后在后台复核一次直播配置：内容变化才回写缓存，频道列表变化才回调。
+     */
+    public void refreshLiveConfigIfChanged(final LiveConfigRefreshCallback callback) {
+        if (revalidatingLiveConfig) return;
+        String apiUrl = Hawk.get(HawkConfig.LIVE_API_URL, "");
+        if (apiUrl.isEmpty()) apiUrl = Hawk.get(HawkConfig.API_URL, "");
+        // 回到局域网后发现到新地址（服务端 IP 变更）时，复核直接切到新地址自愈
+        String discovered = LanServiceDiscovery.get().getConfigUrl();
+        if (!discovered.isEmpty() && !discovered.equals(apiUrl)) {
+            LOG.i("echo-live-config revalidate switching to discovered url: " + discovered);
+            Hawk.put(HawkConfig.LIVE_API_URL, discovered);
+            apiUrl = discovered;
+        }
+        if (apiUrl.isEmpty()) return;
+
+        final String liveApiUrl = apiUrl;
+        final File liveCache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/" + MD5.encode(liveApiUrl));
+        final String cachedContent = readLiveCache(liveCache);
+        String liveApiConfigUrl = configUrl(liveApiUrl);
+        final String liveConfigKey = TempKey;
+        revalidatingLiveConfig = true;
+        fetchConfigAsync(liveApiUrl, liveApiConfigUrl, liveConfigKey, new ConfigFetchCallback() {
+            @Override
+            public void success(String json) {
+                revalidatingLiveConfig = false;
+                if (TextUtils.isEmpty(json) || json.equals(cachedContent)) return;
+                String previousSignature = liveChannelSignature();
+                try {
+                    parseLiveConfigContent(liveApiUrl, json);
+                } catch (Throwable th) {
+                    th.printStackTrace();
+                    restoreLiveConfig(liveApiUrl, cachedContent);
+                    return;
+                }
+                if (!hasLiveConfigResult()) {
+                    restoreLiveConfig(liveApiUrl, cachedContent);
+                    return;
+                }
+                loadedLiveConfigUrl = liveApiUrl;
+                liveConfigFromCache = false;
+                FileUtils.saveCache(liveCache, json);
+                if (!liveChannelSignature().equals(previousSignature)) {
+                    callback.updated();
+                }
+            }
+
+            @Override
+            public void error(String error) {
+                revalidatingLiveConfig = false;
+                LOG.i("echo-live-config revalidate failed: " + error);
+            }
+        });
+    }
+
+    private void restoreLiveConfig(String apiUrl, String cachedContent) {
+        if (TextUtils.isEmpty(cachedContent)) return;
+        try {
+            parseLiveConfigContent(apiUrl, cachedContent);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+
+    private String readLiveCache(File cache) {
+        if (!cache.exists()) return "";
+        FileInputStream fis = null;
+        try {
+            byte[] data = new byte[(int) cache.length()];
+            fis = new FileInputStream(cache);
+            int read = 0;
+            while (read < data.length) {
+                int count = fis.read(data, read, data.length - read);
+                if (count < 0) break;
+                read += count;
+            }
+            return new String(data, 0, read, "UTF-8");
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return "";
+        } finally {
+            if (fis != null) {
+                try {
+                    fis.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    // ===== 离线兜底：与订阅地址解耦的「最后一次成功直播配置」 =====
+
+    private void saveLastGoodLiveConfig(String apiUrl, String content) {
+        if (TextUtils.isEmpty(content)) return;
+        String base = App.getInstance().getFilesDir().getAbsolutePath();
+        FileUtils.saveCache(new File(base + "/" + LIVE_LAST_CONFIG_FILE), content);
+        FileUtils.saveCache(new File(base + "/" + LIVE_LAST_URL_FILE), apiUrl == null ? "" : apiUrl);
+    }
+
+    /**
+     * 用最后一次成功的地址与内容渲染直播列表（离开局域网 / 服务端换 IP 时兜底）。
+     *
+     * @return 成功渲染返回 true
+     */
+    private boolean restoreLastGoodLiveConfig() {
+        String base = App.getInstance().getFilesDir().getAbsolutePath();
+        String content = readLiveCache(new File(base + "/" + LIVE_LAST_CONFIG_FILE));
+        if (TextUtils.isEmpty(content)) return false;
+        String lastUrl = readLiveCache(new File(base + "/" + LIVE_LAST_URL_FILE)).trim();
+        try {
+            parseLiveConfigContent(lastUrl, content);
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return false;
+        }
+        if (!hasLiveConfigResult()) return false;
+        loadedLiveConfigUrl = lastUrl;
+        liveConfigFromCache = true;
+        LOG.i("echo-live-config restored from last good config, url=" + lastUrl);
+        return true;
+    }
+
+    /** 后台等待发现结果后再加载，回调在主线程执行，避免主线程 sleep 卡住界面 */
+    private void awaitDiscoveryAndLoad(long timeoutMs, final LoadConfigCallback callback) {
+        LanServiceDiscovery.get().awaitConfigUrlAsync(timeoutMs, new LanServiceDiscovery.DiscoveryCallback() {
+            @Override
+            public void onDiscovered(String url) {
+                if (url.isEmpty()) {
+                    callback.notice("未发现 TVAgent 服务，且无离线缓存可用");
+                    callback.error("-1");
+                    return;
+                }
+                Hawk.put(HawkConfig.LIVE_API_URL, url);
+                LOG.i("echo-discovery: set LIVE_API_URL from discovery(async): " + url);
+                loadLiveConfig(true, callback);
+            }
+        });
+    }
+
+    /**
+     * 只统计频道与地址；忽略管道写入的更新时间标记分组，避免仅时间戳变化就打断播放。
+     */
+    private String liveChannelSignature() {
+        StringBuilder sb = new StringBuilder();
+        for (LiveChannelGroup group : liveChannelGroupList) {
+            String groupName = group.getGroupName() == null ? "" : group.getGroupName();
+            if (groupName.contains("更新时间")) continue;
+            sb.append(groupName).append('\n');
+            List<LiveChannelItem> channels = group.getLiveChannels();
+            if (channels == null) continue;
+            for (LiveChannelItem channel : channels) {
+                sb.append(channel.getChannelName()).append('\t').append(channel.getChannelUrls()).append('\n');
+            }
+        }
+        return MD5.string2MD5(sb.toString());
     }
 
     public static String getLiveGroupIndexKey() {

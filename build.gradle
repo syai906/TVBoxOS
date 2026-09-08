@@ -8,18 +8,15 @@ buildscript {
         maven { url "https://maven.aliyun.com/repository/public" }
         maven { url "https://maven.aliyun.com/repository/releases" }
         maven { url "https://storage.googleapis.com/r8-releases/raw" }
-        maven { url "https://chaquo.com/maven" }
         maven {
             url "http://4thline.org/m2"
             allowInsecureProtocol = true
         }
     }
     dependencies {
-        classpath 'com.android.tools.build:gradle:7.2.2'
-
-        // NOTE: Do not place your application dependencies here; they belong
-        // in the individual module build.gradle files
-        classpath "com.chaquo.python:gradle:12.0.1"
+        // 升级至 AGP 8.7.3（配合 Gradle 8.9），支持 JDK 21 编译；
+        // 同时移除 Chaquopy（python flavor 不再构建，仅保留 java 系 flavor）
+        classpath 'com.android.tools.build:gradle:8.7.3'
     }
 }
 

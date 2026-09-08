@@ -3,6 +3,7 @@ plugins {
 }
 
 android {
+    namespace 'com.whl.quickjs.android'
     compileSdkVersion 33
 
     buildFeatures {

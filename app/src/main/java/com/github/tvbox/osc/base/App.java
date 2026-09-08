@@ -7,6 +7,7 @@ import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.callback.EmptyCallback;
 import com.github.tvbox.osc.callback.LoadingCallback;
 import com.github.tvbox.osc.data.AppDataManager;
+import com.github.tvbox.osc.discovery.LanServiceDiscovery;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.util.AppManager;
 import com.github.tvbox.osc.util.EpgUtil;
@@ -59,6 +60,8 @@ public class App extends MultiDexApplication {
         PlayerHelper.init();
         QuickJSLoader.init();
         FileUtils.cleanPlayerCache();
+        // 启动 TVAgent 局域网服务发现监听（后台守护线程，支持零配置接入与 IP 自愈）
+        LanServiceDiscovery.get().start();
     }
 
     private void initParams() {
