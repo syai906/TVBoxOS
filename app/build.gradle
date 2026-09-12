@@ -110,6 +110,15 @@ android {
 repositories {
 
 }
+
+// Apple Silicon (macOS aarch64) 编译修复：Room 2.3.0 注解处理器捆绑的 sqlite-jdbc 3.25
+// 没有 macOS aarch64 原生库，导致 compileJavaWithJavac 抛
+// "No native library is found for os.name=Mac and os.arch=aarch64"。
+// 仅作用于注解处理 classpath（应用运行时使用系统 SQLite，APK 不受影响）。
+configurations.configureEach {
+    resolutionStrategy.force 'org.xerial:sqlite-jdbc:3.40.1.0'
+}
+
 dependencies {
     api fileTree(dir: "libs", include: ["*.jar","*.aar"])
 
